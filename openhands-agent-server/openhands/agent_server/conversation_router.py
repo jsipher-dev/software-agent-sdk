@@ -647,6 +647,71 @@ async def switch_conversation_acp_model(
     return Success()
 
 
+@conversation_router.get(
+    "/{conversation_id}/acp_commands",
+    responses={404: {"description": "Conversation not found"}},
+)
+async def list_conversation_acp_commands(
+    conversation_id: UUID,
+    conversation_service: ConversationService = Depends(get_conversation_service),
+) -> list[dict]:
+    """List the slash-commands the ACP server advertises for this conversation.
+
+    Returns each command's ``name``, ``description``, and optional ``input``
+    hint (raw ACP command dicts). Empty for non-ACP conversations or before the
+    ACP server has advertised any commands.
+    """
+    event_service = await conversation_service.get_event_service(conversation_id)
+    if event_service is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND)
+    try:
+        return await event_service.list_acp_commands()
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e),
+        )
+
+
+@conversation_router.post(
+    "/{conversation_id}/execute_acp_command",
+    responses={
+        400: {"description": "Agent is not ACP, command empty, or server rejected"},
+        404: {"description": "Conversation not found"},
+        504: {"description": "ACP server did not answer the command in time"},
+    },
+)
+async def execute_conversation_acp_command(
+    conversation_id: UUID,
+    command: str = Body(..., embed=True),
+    conversation_service: ConversationService = Depends(get_conversation_service),
+) -> dict:
+    """Execute an ACP slash-command (e.g. ``compact``, ``usage``, ``model``).
+
+    Issues a protocol-level ``commands/execute`` call to the ACP subprocess.
+    Only valid for a started ACP conversation. Emits an ``ACPCommandResultEvent``
+    (persisted + broadcast) so the command output renders in the chat, and
+    returns the server's response: ``{"success": bool, "command": str,
+    "message": str | None, "data": object | None}``.
+    """
+    event_service = await conversation_service.get_event_service(conversation_id)
+    if event_service is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND)
+    try:
+        result = await event_service.execute_acp_command(command)
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e),
+        )
+    except TimeoutError as e:
+        raise HTTPException(
+            status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+            detail=str(e),
+        )
+    return result
+
+
 @conversation_router.patch(
     "/{conversation_id}", responses={404: {"description": "Item not found"}}
 )

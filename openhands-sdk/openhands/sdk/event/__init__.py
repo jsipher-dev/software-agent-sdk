@@ -1,3 +1,5 @@
+from openhands.sdk.event.acp_command_result import ACPCommandResultEvent
+from openhands.sdk.event.acp_metadata import ACPMetadataEvent
 from openhands.sdk.event.acp_tool_call import ACPToolCallEvent
 from openhands.sdk.event.base import Event, LLMConvertibleEvent
 from openhands.sdk.event.condenser import (
@@ -29,6 +31,8 @@ from openhands.sdk.event.user_action import InterruptEvent, PauseEvent
 
 
 __all__ = [
+    "ACPCommandResultEvent",
+    "ACPMetadataEvent",
     "ACPToolCallEvent",
     "Event",
     "LLMConvertibleEvent",

@@ -1277,9 +1277,319 @@ class TestOpenHandsACPClient:
         client = _OpenHandsACPBridge()
         await client.ext_notification("test", {})  # Should not raise
 
+    @pytest.mark.asyncio
+    async def test_ext_notification_kiro_metadata_logs_credits(self, caplog):
+        """Kiro sends per-turn usage via the _kiro.dev/metadata extension
+        notification (arrives here with the leading underscore stripped).
+        The handler must decode credits/context/duration, emit an
+        ACPMetadataEvent, and still be a no-op (returns None)."""
+        from openhands.sdk.event import ACPMetadataEvent
 
-# ---------------------------------------------------------------------------
-# Tool-call event emission (started + terminal, no per-progress fan-out)
+        client = _OpenHandsACPBridge()
+        emitted: list[object] = []
+        client.on_event = emitted.append
+        params = {
+            "sessionId": "sess-1",
+            "contextUsagePercentage": 12.5,
+            "meteringUsage": [
+                {"value": 0.15, "unit": "credit", "unitPlural": "credits"},
+                {"value": 0.06, "unit": "credit", "unitPlural": "credits"},
+            ],
+            "turnDurationMs": 8000,
+        }
+        with caplog.at_level("INFO"):
+            result = await client.ext_notification("kiro.dev/metadata", params)
+        assert result is None
+        # An ACPMetadataEvent was emitted with summed credits (0.15+0.06=0.21).
+        meta_events = [e for e in emitted if isinstance(e, ACPMetadataEvent)]
+        assert len(meta_events) == 1
+        ev = meta_events[0]
+        assert ev.credits == pytest.approx(0.21)
+        assert ev.context_usage_percentage == pytest.approx(12.5)
+        assert ev.turn_duration_ms == 8000
+
+    @pytest.mark.asyncio
+    async def test_ext_notification_kiro_metadata_tolerates_missing_fields(self):
+        """Malformed/partial metadata must not raise."""
+        client = _OpenHandsACPBridge()
+        await client.ext_notification("kiro.dev/metadata", {})  # missing all fields
+        await client.ext_notification(
+            "kiro.dev/metadata", {"meteringUsage": "not-a-list"}
+        )
+
+    @pytest.mark.asyncio
+    async def test_ext_notification_commands_available_stored(self):
+        """_kiro.dev/commands/available populates the available-commands list."""
+        client = _OpenHandsACPBridge()
+        await client.ext_notification(
+            "kiro.dev/commands/available",
+            {
+                "sessionId": "sess-1",
+                "commands": [
+                    {"name": "compact", "description": "Compact the context"},
+                    {"name": "usage", "description": "Show usage"},
+                ],
+            },
+        )
+        assert [c["name"] for c in client._available_commands] == [
+            "compact",
+            "usage",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_ext_notification_kiro_metadata_interim_suppressed(self):
+        """Interim metadata (no turnDurationMs) must NOT emit an event.
+
+        Kiro sends metadata multiple times per turn: interim notifications
+        with empty meteringUsage (credits 0.0) and no turnDurationMs, then a
+        settlement notification with real credits + turnDurationMs. Only the
+        settled one should surface, so the UI doesn't show noisy 'Credits:
+        0.00' lines."""
+        from openhands.sdk.event import ACPMetadataEvent
+
+        client = _OpenHandsACPBridge()
+        emitted: list[object] = []
+        client.on_event = emitted.append
+        # Interim frame: no turnDurationMs, empty metering.
+        await client.ext_notification(
+            "kiro.dev/metadata",
+            {
+                "sessionId": "s1",
+                "contextUsagePercentage": 2.0,
+                "meteringUsage": [],
+            },
+        )
+        assert [e for e in emitted if isinstance(e, ACPMetadataEvent)] == []
+        # Settlement frame: has turnDurationMs -> emits.
+        await client.ext_notification(
+            "kiro.dev/metadata",
+            {
+                "sessionId": "s1",
+                "contextUsagePercentage": 3.0,
+                "meteringUsage": [{"value": 0.25}],
+                "turnDurationMs": 13000,
+            },
+        )
+        meta = [e for e in emitted if isinstance(e, ACPMetadataEvent)]
+        assert len(meta) == 1
+        assert meta[0].credits == pytest.approx(0.25)
+        assert meta[0].turn_duration_ms == 13000
+
+    @pytest.mark.asyncio
+    async def test_settled_metadata_buffered_when_on_event_none(self):
+        """A settlement frame arriving with on_event already torn down must be
+        BUFFERED (not dropped) so the turn finalizer can flush it.
+
+        This is the disappear-on-settle race: Kiro's settlement
+        _kiro.dev/metadata frame arrives in the same instant prompt() returns,
+        so it can land after _clear_turn_callbacks() nulled on_event. Before the
+        fix the event was silently discarded and the credits/context chip
+        vanished. Now it is buffered + retrievable as 'unemitted'."""
+        from openhands.sdk.event import ACPMetadataEvent
+
+        client = _OpenHandsACPBridge()
+        client.arm_metadata_clock()
+        # on_event is None (post-teardown): the live emit is skipped.
+        assert client.on_event is None
+        await client.ext_notification(
+            "kiro.dev/metadata",
+            {
+                "sessionId": "s1",
+                "contextUsagePercentage": 10.0,
+                "meteringUsage": [{"value": 2.6}],
+                "turnDurationMs": 79000,
+            },
+        )
+        # The settlement was received and buffered as NOT emitted.
+        assert client._settled_metadata_received.is_set()
+        settled = client.take_unemitted_settled_metadata()
+        assert isinstance(settled, ACPMetadataEvent)
+        assert settled.credits == pytest.approx(2.6)
+        assert settled.turn_duration_ms == 79000
+        # Taking it marks it emitted, so a second take returns None (no dupes).
+        assert client.take_unemitted_settled_metadata() is None
+
+    @pytest.mark.asyncio
+    async def test_settled_metadata_not_double_emitted_when_live(self):
+        """When on_event IS set, the frame emits live AND is marked emitted, so
+        the finalizer's take() returns None — no duplicate chip."""
+        from openhands.sdk.event import ACPMetadataEvent
+
+        client = _OpenHandsACPBridge()
+        client.arm_metadata_clock()
+        emitted: list[object] = []
+        client.on_event = emitted.append
+        await client.ext_notification(
+            "kiro.dev/metadata",
+            {
+                "sessionId": "s1",
+                "contextUsagePercentage": 5.0,
+                "meteringUsage": [{"value": 0.5}],
+                "turnDurationMs": 3000,
+            },
+        )
+        # Emitted live exactly once.
+        assert len([e for e in emitted if isinstance(e, ACPMetadataEvent)]) == 1
+        # And NOT available for a deferred flush (would be a duplicate).
+        assert client.take_unemitted_settled_metadata() is None
+
+    @pytest.mark.asyncio
+    async def test_arm_metadata_clock_clears_prior_turn(self):
+        """Arming a new turn clears a prior turn's buffered settlement so it
+        can't leak into the next turn's finalizer flush."""
+        client = _OpenHandsACPBridge()
+        client.arm_metadata_clock()
+        await client.ext_notification(
+            "kiro.dev/metadata",
+            {"sessionId": "s1", "meteringUsage": [{"value": 1.0}],
+             "turnDurationMs": 1000},
+        )
+        assert client._settled_metadata_received.is_set()
+        # New turn: buffer + signal reset.
+        client.arm_metadata_clock()
+        assert not client._settled_metadata_received.is_set()
+        assert client.take_unemitted_settled_metadata() is None
+
+    @pytest.mark.asyncio
+    async def test_session_update_available_commands_stored(self):
+        """Standard ACP AvailableCommandsUpdate (session/update) populates the
+        command list — this is the channel Kiro actually uses, in addition to
+        the _kiro.dev/commands/available extension notification."""
+        from acp.schema import (
+            AvailableCommand,
+            AvailableCommandsUpdate,
+        )
+
+        client = _OpenHandsACPBridge()
+        update = AvailableCommandsUpdate(
+            session_update="available_commands_update",
+            available_commands=[
+                AvailableCommand(name="compact", description="Compact the context"),
+                AvailableCommand(name="model", description="Switch model"),
+            ],
+        )
+        await client.session_update("s1", update)
+        assert [c["name"] for c in client._available_commands] == [
+            "compact",
+            "model",
+        ]
+        assert client._available_commands[0]["description"] == "Compact the context"
+
+
+class TestExecuteCommandSlashHandling:
+    """``execute_command`` must send the structured ``TuiCommand`` payload.
+
+    Kiro's ``_kiro.dev/commands/execute`` (verified live against kiro-cli
+    2.22.1) does NOT accept a string command: the ``command`` param is an
+    adjacently-tagged ``TuiCommand`` enum serialized as
+    ``{"command": <bare_name>, "args": {}}`` where ``<bare_name>`` is the
+    lower-case command WITHOUT a leading slash. Sending a ``/name`` string
+    (the old Eclipse-era contract) is rejected with JSON-RPC ``-32700``
+    "Parse error" (``invalid type: string ..., expected adjacently tagged enum
+    TuiCommand``). These tests pin that the SDK strips any leading slash(es)
+    from any input form (bare, single-, or double-slash) and wraps the bare
+    name in the structured object with an empty ``args``.
+    """
+
+    @staticmethod
+    def _wire_live_session(agent: ACPAgent, ext_result: dict[str, Any]):
+        """Wire a fake live ACP session and return the captured ext_method mock.
+
+        ``_executor.run_async`` is made to drive the passed coroutine to
+        completion so ``_do_execute`` actually awaits ``conn.ext_method`` and we
+        can assert on the payload it received.
+        """
+        conn = MagicMock()
+        conn.ext_method = AsyncMock(return_value=ext_result)
+
+        executor = MagicMock()
+
+        def _run_async(coro, timeout=None):  # noqa: ARG001
+            return asyncio.get_event_loop().run_until_complete(coro)
+
+        executor.run_async.side_effect = _run_async
+
+        agent._conn = conn
+        agent._session_id = "sess-1"
+        agent._executor = executor
+        assert agent.has_live_acp_session is True
+        return conn
+
+    @pytest.mark.parametrize(
+        "given",
+        ["context", "/context", "//context", "  /context  ", " context "],
+    )
+    def test_sends_structured_tui_command(self, given: str):
+        agent = _make_agent()
+        conn = self._wire_live_session(agent, {"success": True})
+
+        result = agent.execute_command(given)
+
+        # execute_command now returns the full response dict (not a bare bool)
+        # so callers can surface the command's message/data as a visible event.
+        assert isinstance(result, dict)
+        assert result["success"] is True
+        assert result["command"] == "/context"
+        conn.ext_method.assert_awaited_once()
+        method, payload = conn.ext_method.await_args.args
+        assert method == "kiro.dev/commands/execute"
+        assert payload["sessionId"] == "sess-1"
+        # command is the adjacently-tagged TuiCommand enum, NOT a string:
+        # {"command": <bare_name>, "args": {}}.
+        assert payload["command"] == {"command": "context", "args": {}}
+        assert not isinstance(payload["command"], str)
+
+    def test_returns_message_and_data(self):
+        # The server's message/data (e.g. the /context breakdown) must be
+        # preserved in the return value, not discarded — this is what lets the
+        # output actually render in the UI.
+        agent = _make_agent()
+        conn = self._wire_live_session(
+            agent,
+            {
+                "success": True,
+                "message": "Context breakdown - 3% used",
+                "data": {"contextUsagePercentage": 3.4},
+            },
+        )
+
+        result = agent.execute_command("/context")
+
+        assert result == {
+            "success": True,
+            "command": "/context",
+            "message": "Context breakdown - 3% used",
+            "data": {"contextUsagePercentage": 3.4},
+        }
+        conn.ext_method.assert_awaited_once()
+
+    def test_missing_message_and_data_default_to_none(self):
+        agent = _make_agent()
+        self._wire_live_session(agent, {"success": False})
+
+        result = agent.execute_command("/compact")
+
+        assert result == {
+            "success": False,
+            "command": "/compact",
+            "message": None,
+            "data": None,
+        }
+
+    def test_empty_command_rejected(self):
+        agent = _make_agent()
+        # No live session needed; the empty-check happens first.
+        with pytest.raises(ValueError, match="non-empty"):
+            agent.execute_command("   ")
+
+    def test_slash_only_command_rejected(self):
+        # A command that is nothing but slashes/whitespace is empty after
+        # normalization and must not be sent as a bare "/".
+        agent = _make_agent()
+        with pytest.raises(ValueError, match="non-empty"):
+            agent.execute_command("//")
+
+
 # ---------------------------------------------------------------------------
 
 

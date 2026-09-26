@@ -1787,6 +1787,32 @@ class EventService:
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, self._conversation.switch_acp_model, model)
 
+    async def list_acp_commands(self) -> list[dict[str, object]]:
+        """List slash-commands advertised by the ACP server for this session."""
+        if self._conversation is None:
+            raise ValueError("inactive_service")
+        # Non-blocking (reads cached state), but keep it off the event loop for
+        # symmetry and to avoid touching conversation state on the loop thread.
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            None, self._conversation.list_acp_commands
+        )
+
+    async def execute_acp_command(self, command: str) -> dict[str, object]:
+        """Execute an ACP slash-command (e.g. ``compact``) on the live session.
+
+        Runs the blocking protocol-level ``commands/execute`` round-trip in a
+        worker thread. Emits an ``ACPCommandResultEvent`` (persisted + broadcast)
+        carrying the command output, and returns the server's response dict
+        (``success``, ``command``, ``message``, ``data``).
+        """
+        if self._conversation is None:
+            raise ValueError("inactive_service")
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            None, self._conversation.execute_acp_command, command
+        )
+
     async def close(self):
         if self.bash_event_service is not None:
             await self.bash_event_service.close()

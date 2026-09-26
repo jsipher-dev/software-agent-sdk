@@ -46,6 +46,7 @@ from acp.schema import (
     AgentMessageChunk,
     AgentThoughtChunk,
     AllowedOutcome,
+    AvailableCommandsUpdate,
     EnvVariable,
     HttpHeader,
     HttpMcpServer,
@@ -91,6 +92,7 @@ from openhands.sdk.credential import (
     VersionedCredentialBinding,
 )
 from openhands.sdk.event import (
+    ACPMetadataEvent,
     ACPToolCallEvent,
     ActionEvent,
     MessageEvent,
@@ -145,6 +147,17 @@ if TYPE_CHECKING:
 # completes almost immediately. This timeout is a safety net for slow
 # or remote servers.
 _USAGE_UPDATE_TIMEOUT: float = float(os.environ.get("ACP_USAGE_UPDATE_TIMEOUT", "2.0"))
+
+# Max time the turn finalizer waits, after ``prompt()`` returns, for the
+# settled ``_kiro.dev/metadata`` frame (the per-turn credits/context chip).
+# Live capture (kiro-cli 2.22.1) shows this frame arrives in the SAME instant
+# the prompt response returns, so the wait is normally satisfied immediately;
+# the small budget only covers the rare case where the notification is
+# delivered a hair after the response. Kept short so a server that never sends
+# it can't stall turn completion.
+_ACP_METADATA_SETTLE_TIMEOUT: float = float(
+    os.environ.get("ACP_METADATA_SETTLE_TIMEOUT", "0.5")
+)
 
 # Retry configuration for transient ACP connection errors.
 # These errors can occur when the connection drops mid-conversation but the
@@ -1303,6 +1316,28 @@ class _OpenHandsACPBridge:
         # Per-turn synchronization for UsageUpdate notifications.
         self._turn_usage_updates: dict[str, Any] = {}
         self._usage_received: dict[str, asyncio.Event] = {}
+        # Available slash-commands advertised by the ACP server via the
+        # ``_kiro.dev/commands/available`` extension notification. Each entry is
+        # the raw command dict ({name, description, input?, _meta}). Persists
+        # across turns (the server sends the full list on change, not deltas).
+        self._available_commands: list[dict[str, Any]] = []
+        # Per-turn settled ACP usage (``_kiro.dev/metadata`` with
+        # ``turnDurationMs``). Kiro sends this settlement notification at
+        # turn-end, and — verified live against kiro-cli 2.22.1 — it can arrive
+        # on the portal thread in the SAME instant the ``prompt()`` response
+        # returns. It is an ``ext_notification``, NOT a ``session_update``, so
+        # it is outside the turn's session_update drain: if it lands after
+        # ``_clear_turn_callbacks`` nulls ``on_event`` it would be silently
+        # dropped (the credits/context chip then "vanishes on settle" — a live,
+        # intermittent, frontend-invisible race). We therefore BUFFER the built
+        # ``ACPMetadataEvent`` here and signal ``_settled_metadata_received`` so
+        # the turn finalizer can flush it through the still-valid ``on_event``
+        # even when the notification narrowly loses the race. ``_metadata_lock``
+        # guards the pair against the portal-vs-caller thread race.
+        self._settled_metadata: ACPMetadataEvent | None = None
+        self._settled_metadata_emitted: bool = False
+        self._settled_metadata_received: threading.Event = threading.Event()
+        self._metadata_lock: threading.Lock = threading.Lock()
         # Fork session state for ask_agent() — guarded by _fork_lock to
         # prevent concurrent ask_agent() calls from colliding.
         self._fork_lock = threading.Lock()
@@ -1321,6 +1356,34 @@ class _OpenHandsACPBridge:
         self._masking_error = None
         # Note: telemetry state (_last_cost, _context_window, _last_activity_signal,
         # etc.) is intentionally NOT cleared — it accumulates across turns.
+        self.arm_metadata_clock()
+
+    def arm_metadata_clock(self) -> None:
+        """Reset the per-turn settled-metadata buffer at the start of a turn.
+
+        Called before each prompt so a settlement frame buffered for one turn
+        can't leak into the next. Safe to call from the caller thread while the
+        portal thread is idle between turns.
+        """
+        with self._metadata_lock:
+            self._settled_metadata = None
+            self._settled_metadata_emitted = False
+            self._settled_metadata_received.clear()
+
+    def take_unemitted_settled_metadata(self) -> "ACPMetadataEvent | None":
+        """Return the buffered settled metadata iff it was never emitted live.
+
+        Used by the turn finalizer to flush a settlement frame that arrived
+        too late (after ``on_event`` was about to be torn down) to be emitted
+        from ``ext_notification`` directly. Marks it emitted so it is never
+        double-counted. Returns ``None`` when nothing is buffered or it was
+        already emitted live.
+        """
+        with self._metadata_lock:
+            if self._settled_metadata is None or self._settled_metadata_emitted:
+                return None
+            self._settled_metadata_emitted = True
+            return self._settled_metadata
 
     def arm_activity_clock(self) -> None:
         """Mark "now" as the last activity for the idle-timeout watchdog.
@@ -1447,6 +1510,14 @@ class _OpenHandsACPBridge:
             if isinstance(update.content, TextContentBlock):
                 self.accumulated_thoughts.append(self._mask_value(update.content.text))
         elif isinstance(update, UsageUpdate):
+            logger.debug(
+                "ACP UsageUpdate [session %s] cost=%s size=%s used=%s",
+                _fingerprint_session_id(session_id),
+                getattr(update, "cost", None),
+                getattr(update, "size", None),
+                getattr(update, "used", None),
+            )
+
             # Store the update for step()/ask_agent() to process in one place.
             self._context_window = update.size
             self._context_window_by_session[session_id] = update.size
@@ -1521,6 +1592,32 @@ class _OpenHandsACPBridge:
             if target is not None and became_terminal:
                 self.trace.tool_finished(target)
                 self._emit_tool_call_event(target)
+            self._maybe_signal_activity()
+        elif isinstance(update, AvailableCommandsUpdate):
+            # Standard ACP channel for advertising slash-commands. Kiro (and
+            # other ACP servers) send the command list here via session/update
+            # with session_update="available_commands_update" — NOT only via the
+            # _kiro.dev/commands/available extension notification. Normalize each
+            # AvailableCommand into the raw dict shape the client expects
+            # ({name, description, input?}) and store it (full list, not a
+            # delta). This is what makes the slash-command menu populate.
+            cmds: list[dict[str, Any]] = []
+            for c in update.available_commands or []:
+                entry: dict[str, Any] = {"name": getattr(c, "name", None)}
+                desc = getattr(c, "description", None)
+                if desc is not None:
+                    entry["description"] = desc
+                inp = getattr(c, "input", None)
+                if inp is not None:
+                    # AvailableCommandInput is a RootModel; expose its raw value.
+                    entry["input"] = getattr(inp, "root", inp)
+                if entry["name"]:
+                    cmds.append(entry)
+            self._available_commands = cmds
+            logger.debug(
+                "ACP available commands updated (session/update): %d command(s)",
+                len(cmds),
+            )
             self._maybe_signal_activity()
         else:
             logger.debug("ACP session update: %s", type(update).__name__)
@@ -1646,17 +1743,122 @@ class _OpenHandsACPBridge:
 
     async def ext_method(
         self,
-        method: str,  # noqa: ARG002
-        params: dict[str, Any],  # noqa: ARG002
+        method: str,
+        params: dict[str, Any],
     ) -> dict[str, Any]:
+        # ACP extension REQUESTS (JSON-RPC method names starting with ``_``).
+        # No extension request is acted on today; log at debug and return an
+        # empty result to preserve the no-op contract.
+        logger.debug(
+            "ACP ext_method: method=_%s payload_keys=%s",
+            method,
+            list(params.keys()) if isinstance(params, dict) else type(params),
+        )
         return {}
 
     async def ext_notification(
         self,
-        method: str,  # noqa: ARG002
-        params: dict[str, Any],  # noqa: ARG002
+        method: str,
+        params: dict[str, Any],
     ) -> None:
-        pass
+        # ACP extension NOTIFICATIONS. The ``acp`` router strips the leading
+        # underscore, so Kiro's ``_kiro.dev/metadata`` arrives here as
+        # ``method == "kiro.dev/metadata"``. That notification is where Kiro
+        # sends per-turn usage — credits, context %, and turn duration — which
+        # it does NOT put in the standard UsageUpdate / PromptResponse.usage
+        # (both observed empty for Kiro 2.22.0). Payload shape (from the Kiro
+        # ACP protocol):
+        #   { sessionId, contextUsagePercentage: float,
+        #     meteringUsage: [ { value: float, unit, unitPlural } ],
+        #     turnDurationMs: int }
+        # Credits = sum(meteringUsage[].value).
+        try:
+            logger.debug(
+                "ACP ext_notification: method=_%s payload_keys=%s",
+                method,
+                list(params.keys()) if isinstance(params, dict) else type(params),
+            )
+            if method == "kiro.dev/metadata" and isinstance(params, dict):
+                metering = params.get("meteringUsage") or []
+                credits: float | None = None
+                if isinstance(metering, list):
+                    credits = 0.0
+                    for u in metering:
+                        if isinstance(u, dict) and isinstance(
+                            u.get("value"), (int, float)
+                        ):
+                            credits += float(u["value"])
+                ctx_pct = params.get("contextUsagePercentage")
+                duration = params.get("turnDurationMs")
+                logger.debug(
+                    "ACP Kiro metadata: credits=%s context_usage_pct=%s "
+                    "turn_duration_ms=%s",
+                    credits,
+                    ctx_pct,
+                    duration,
+                )
+                # Emit a first-class event so clients can display per-turn
+                # credits + context% without knowing the wire format.
+                #
+                # Kiro sends metadata MULTIPLE times per turn: interim
+                # notifications while streaming (empty ``meteringUsage`` ->
+                # credits 0.0, and no ``turnDurationMs``) and one settlement
+                # notification at turn end that carries the real credits and
+                # ``turnDurationMs``. Emitting every interim one produces noisy
+                # "Credits: 0.00" lines. Only emit the settled event: the
+                # presence of ``turnDurationMs`` is the reliable end-of-turn
+                # signal. (If a future server sends context-only updates with a
+                # duration, those still surface.)
+                is_settled = isinstance(duration, (int, float))
+                if is_settled:
+                    settled_event = ACPMetadataEvent(
+                        credits=credits,
+                        context_usage_percentage=(
+                            float(ctx_pct)
+                            if isinstance(ctx_pct, (int, float))
+                            else None
+                        ),
+                        turn_duration_ms=(
+                            int(duration)
+                            if isinstance(duration, (int, float))
+                            else None
+                        ),
+                        provider=getattr(self, "_agent_name", None),
+                    )
+                    # Buffer + signal FIRST, then try to emit live. This closes
+                    # the teardown race: the settlement frame arrives on the
+                    # portal thread in the same instant ``prompt()`` returns, so
+                    # ``on_event`` may already be (or be about to be) nulled by
+                    # ``_clear_turn_callbacks``. Buffering lets the turn
+                    # finalizer flush it through the still-valid ``on_event`` if
+                    # the live emit below is skipped — so the credits/context
+                    # chip no longer intermittently vanishes on settle.
+                    emitted_live = False
+                    on_event = self.on_event
+                    if on_event is not None:
+                        try:
+                            on_event(settled_event)
+                            emitted_live = True
+                        except Exception:
+                            logger.debug(
+                                "ACPMetadataEvent emit failed", exc_info=True
+                            )
+                    with self._metadata_lock:
+                        self._settled_metadata = settled_event
+                        # Only mark emitted if the live emit actually succeeded;
+                        # otherwise leave it for the finalizer to flush.
+                        self._settled_metadata_emitted = emitted_live
+                    self._settled_metadata_received.set()
+            elif method == "kiro.dev/commands/available" and isinstance(params, dict):
+                cmds = params.get("commands")
+                if isinstance(cmds, list):
+                    self._available_commands = cmds
+                    logger.debug(
+                        "ACP available commands updated: %d command(s)",
+                        len(cmds),
+                    )
+        except Exception:
+            logger.debug("ext_notification handling failed", exc_info=True)
 
     def on_connect(self, conn: Any) -> None:  # noqa: ARG002
         pass
@@ -3598,15 +3800,30 @@ class ACPAgent(AgentBase):
         session_id = self._session_id
         usage_sync = self._client.prepare_usage_sync(session_id)
         response = await conn.prompt(session_id=session_id, prompt=prompt_blocks)
+        usage_timed_out = False
         if self._client.get_turn_usage_update(session_id) is None:
             try:
                 await asyncio.wait_for(usage_sync.wait(), timeout=_USAGE_UPDATE_TIMEOUT)
             except TimeoutError:
+                usage_timed_out = True
                 logger.warning(
                     "UsageUpdate not received within %.1fs for session %s",
                     _USAGE_UPDATE_TIMEOUT,
                     _fingerprint_session_id(session_id),
                 )
+
+        # Debug breadcrumb: whether this turn produced standard usage data.
+        # Kiro reports usage via the ``_kiro.dev/metadata`` extension instead
+        # (decoded into an ``ACPMetadataEvent`` in the bridge), so ``absent``
+        # here is normal for Kiro and not an error.
+        logger.debug(
+            "ACP turn usage: usage_update=%s timed_out=%s response_usage=%s",
+            "present"
+            if self._client.get_turn_usage_update(session_id) is not None
+            else "absent",
+            usage_timed_out,
+            "present" if getattr(response, "usage", None) is not None else "absent",
+        )
         return response
 
     def _idle_timeout_message(self) -> str:
@@ -3678,6 +3895,39 @@ class ACPAgent(AgentBase):
     @staticmethod
     def _prompt_response_was_cancelled(response: PromptResponse | None) -> bool:
         return response is not None and response.stop_reason == "cancelled"
+    def _flush_settled_metadata(
+        self,
+        on_event: ConversationCallbackType,
+    ) -> None:
+        """Emit the per-turn settled ACP usage chip if it wasn't emitted live.
+
+        The ``_kiro.dev/metadata`` settlement frame races
+        ``_clear_turn_callbacks`` at turn-end (see ``_OpenHandsACPBridge``).
+        Wait a short, bounded time for it to arrive, then emit the buffered
+        ``ACPMetadataEvent`` here — through the turn's still-valid ``on_event``
+        — but only if the live emit in ``ext_notification`` didn't already fire.
+        This makes the chip deterministic (it used to intermittently vanish on
+        settle when the notification lost the race).
+        """
+        client = self._client
+        if client is None:
+            return
+        # Fast path: the frame already arrived (usual case — it lands in the
+        # same instant the prompt returns). Otherwise wait a small budget.
+        if not client._settled_metadata_received.is_set():
+            client._settled_metadata_received.wait(
+                timeout=_ACP_METADATA_SETTLE_TIMEOUT
+            )
+        settled = client.take_unemitted_settled_metadata()
+        if settled is None:
+            return
+        try:
+            on_event(settled)
+        except Exception:
+            logger.debug(
+                "Deferred ACPMetadataEvent flush failed", exc_info=True
+            )
+
 
     def _finalize_successful_turn(
         self,
@@ -3701,6 +3951,14 @@ class ACPAgent(AgentBase):
             elapsed=elapsed,
             usage_update=usage_update,
         )
+
+        # Flush the per-turn Kiro usage chip (``_kiro.dev/metadata`` settlement)
+        # while ``on_event`` is still valid. The settlement notification races
+        # ``_clear_turn_callbacks`` (both fire around prompt-return); if it lost
+        # that race the live emit in ``ext_notification`` was skipped and the
+        # event is only buffered. Emit the buffered event here so the chip is
+        # persisted deterministically instead of vanishing on settle.
+        self._flush_settled_metadata(on_event)
 
         # Tool cards were already streamed live from
         # _OpenHandsACPBridge.session_update: one early ``started`` event per
@@ -4499,6 +4757,152 @@ class ACPAgent(AgentBase):
             provider.key if provider else "unknown",
             _fingerprint_session_id(self._session_id),
         )
+
+    def list_available_commands(self) -> list[dict[str, Any]]:
+        """Return the slash-commands the ACP server currently advertises.
+
+        Populated from the ``_kiro.dev/commands/available`` extension
+        notification (Kiro sends the full list at session start and whenever it
+        changes). Each entry is the raw command dict with at least ``name`` and
+        ``description`` and an optional ``input`` ({``hint``}). Returns an empty
+        list for providers that do not advertise commands, or before the first
+        notification arrives.
+        """
+        if self._client is None:
+            return []
+        # Return a shallow copy so callers cannot mutate the bridge's state.
+        return list(self._client._available_commands)
+
+    def execute_command(self, command: str) -> dict[str, Any]:
+        """Run an ACP slash-command on the live session (e.g. ``/compact``).
+
+        Issues a protocol-level ``_kiro.dev/commands/execute`` request on the
+        live connection. ``command`` may be passed in any form — bare
+        (``compact``), single-slash (``/compact``), or double-slash
+        (``//compact``); the leading slash(es) are stripped to obtain the bare
+        command name.
+
+        Wire contract (verified live against ``kiro-cli`` 2.22.1): the
+        ``command`` param is NOT a string. It is Kiro's adjacently-tagged
+        ``TuiCommand`` enum, serialized as an object with a ``command`` tag (the
+        bare, lower-case command name — e.g. ``context``, ``compact``,
+        ``usage``, ``model``) and a required ``args`` object. We send
+        ``args={}`` so Kiro fills each command's ``*Args`` struct with its
+        defaults (verified: ``help``/``usage``/``model``/``clear``/``compact``/
+        ``context``/``stats``/``tools`` all succeed with ``{}``). So the full
+        param is::
+
+            {"sessionId": <sid>, "command": {"command": <bare_name>, "args": {}}}
+
+        (Older ``kiro-cli`` builds — and the Eclipse reference client written
+        against them — sent ``command`` as a plain ``/name`` string; 2.22.1
+        rejects that string form with a JSON-RPC ``-32700`` "Parse error"
+        (``invalid type: string ..., expected adjacently tagged enum
+        TuiCommand``), which is why the string form must not be used.)
+
+        Returns the server's response as a dict with keys ``success`` (bool),
+        ``command`` (the normalized ``/name``), ``message`` (the human-readable
+        output the command produced, e.g. the context breakdown or usage
+        summary — ``None`` if the server sent none), and ``data`` (the optional
+        structured payload — ``None`` if absent). Earlier versions returned only
+        the ``success`` bool and discarded ``message``/``data``, which made
+        output-only commands like ``/context`` and ``/usage`` appear to do
+        nothing in the UI.
+
+        Raises:
+            RuntimeError: If the ACP session has not been initialized yet
+                (i.e. before the first ``run()``).
+            ValueError: If ``command`` is empty/whitespace, or the ACP server
+                rejects the request (e.g. method-not-found on a server without
+                command support, or an unknown command).
+            TimeoutError: If the server does not answer within
+                ``acp_prompt_timeout`` seconds.
+        """
+        if not command or not command.strip():
+            raise ValueError("command must be a non-empty string")
+        # Kiro's ``_kiro.dev/commands/execute`` takes an adjacently-tagged
+        # ``TuiCommand`` enum, not a string: the ``command`` param is the object
+        # ``{"command": <bare_name>, "args": {}}`` where ``<bare_name>`` is the
+        # lower-case command WITHOUT any leading slash (e.g. ``context``,
+        # ``compact``). Strip any leading slash(es) so every input form — bare
+        # (``context``), single- (``/context``), or double-slash (``//context``
+        # from a double-prefixed menu entry) — collapses to the bare name.
+        # (Verified live against kiro-cli 2.22.1: the old ``/name`` STRING form
+        # is rejected with -32700 "Parse error / expected adjacently tagged enum
+        # TuiCommand".)
+        bare_name = command.strip().lstrip("/").strip()
+        if not bare_name:
+            # Input was nothing but slashes/whitespace — never send an empty
+            # command name.
+            raise ValueError("command must be a non-empty string")
+        command_name = bare_name
+        if not self.has_live_acp_session:
+            raise RuntimeError(
+                "ACP session is not initialized; commands can only be executed "
+                "after the conversation has started (first run())."
+            )
+        assert self._conn is not None
+        assert self._session_id is not None
+        assert self._executor is not None
+        conn = self._conn
+        session_id = self._session_id
+
+        async def _do_execute() -> dict[str, Any]:
+            # The acp client adds the leading underscore, so pass the method
+            # without it. ``command`` is Kiro's adjacently-tagged ``TuiCommand``
+            # enum: ``{"command": <bare_name>, "args": {}}`` (empty ``args`` lets
+            # Kiro fill each command's ``*Args`` struct with defaults). Returns
+            # the CommandsExecuteResponse ({success: bool, message?, data?}).
+            return await conn.ext_method(
+                "kiro.dev/commands/execute",
+                {
+                    "sessionId": session_id,
+                    "command": {"command": command_name, "args": {}},
+                },
+            )
+
+        try:
+            result = self._executor.run_async(
+                _do_execute(), timeout=self.acp_prompt_timeout
+            )
+        except ACPRequestError as e:
+            if e.code in _RETRIABLE_SERVER_ERROR_CODES:
+                raise
+            # Surface the JSON-RPC error ``data`` (e.g. Kiro's deserialization
+            # detail) — without it, a wire-format mismatch shows only the opaque
+            # "Parse error" and is very hard to diagnose.
+            detail = f"{e}"
+            data = getattr(e, "data", None)
+            if data is not None:
+                detail = f"{detail} (data={data!r})"
+            raise ValueError(
+                f"ACP server rejected command {command_name!r}: {detail}"
+            ) from e
+        logger.info(
+            "Executed ACP command %r (session=%s)",
+            command_name,
+            _fingerprint_session_id(session_id),
+        )
+        # Preserve the full server response (message/data) rather than
+        # collapsing it to a bool — callers surface the message/data as a
+        # visible conversation event so output-only commands (e.g. /context,
+        # /usage) actually show their result in the UI.
+        display_command = f"/{command_name}"
+        if isinstance(result, dict):
+            message = result.get("message")
+            data = result.get("data")
+            return {
+                "success": bool(result.get("success", True)),
+                "command": display_command,
+                "message": message if isinstance(message, str) else None,
+                "data": data if isinstance(data, dict) else None,
+            }
+        return {
+            "success": True,
+            "command": display_command,
+            "message": None,
+            "data": None,
+        }
 
     def close(self) -> None:
         """Terminate the ACP subprocess and clean up resources."""

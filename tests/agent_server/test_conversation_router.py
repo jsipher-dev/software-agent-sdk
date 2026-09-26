@@ -1457,6 +1457,122 @@ def test_switch_acp_model_timeout_returns_504(
         client.app.dependency_overrides.clear()
 
 
+def test_list_acp_commands_success(
+    client, mock_conversation_service, mock_event_service, sample_conversation_id
+):
+    """list_acp_commands returns the command list from the event service."""
+    mock_conversation_service.get_event_service.return_value = mock_event_service
+    mock_event_service.list_acp_commands.return_value = [
+        {"name": "compact", "description": "Compact the context"},
+        {"name": "usage", "description": "Show usage"},
+    ]
+
+    client.app.dependency_overrides[get_conversation_service] = lambda: (
+        mock_conversation_service
+    )
+    try:
+        response = client.get(
+            f"/api/conversations/{sample_conversation_id}/acp_commands",
+        )
+        assert response.status_code == 200
+        names = [c["name"] for c in response.json()]
+        assert names == ["compact", "usage"]
+        mock_event_service.list_acp_commands.assert_awaited_once()
+    finally:
+        client.app.dependency_overrides.clear()
+
+
+def test_list_acp_commands_not_found(
+    client, mock_conversation_service, sample_conversation_id
+):
+    """list_acp_commands returns 404 for an unknown conversation."""
+    mock_conversation_service.get_event_service.return_value = None
+    client.app.dependency_overrides[get_conversation_service] = lambda: (
+        mock_conversation_service
+    )
+    try:
+        response = client.get(
+            f"/api/conversations/{sample_conversation_id}/acp_commands",
+        )
+        assert response.status_code == 404
+    finally:
+        client.app.dependency_overrides.clear()
+
+
+def test_execute_acp_command_success(
+    client, mock_conversation_service, mock_event_service, sample_conversation_id
+):
+    """execute_acp_command forwards the command and returns the full result."""
+    mock_conversation_service.get_event_service.return_value = mock_event_service
+    mock_event_service.execute_acp_command.return_value = {
+        "success": True,
+        "command": "/context",
+        "message": "Context breakdown - 3% used",
+        "data": {"contextUsagePercentage": 3.4},
+    }
+
+    client.app.dependency_overrides[get_conversation_service] = lambda: (
+        mock_conversation_service
+    )
+    try:
+        response = client.post(
+            f"/api/conversations/{sample_conversation_id}/execute_acp_command",
+            json={"command": "context"},
+        )
+        assert response.status_code == 200
+        body = response.json()
+        assert body["success"] is True
+        # The command's human-readable output and structured data must be
+        # returned (not discarded) so clients can render it.
+        assert body["message"] == "Context breakdown - 3% used"
+        assert body["data"] == {"contextUsagePercentage": 3.4}
+        mock_event_service.execute_acp_command.assert_awaited_once_with("context")
+    finally:
+        client.app.dependency_overrides.clear()
+
+
+def test_execute_acp_command_non_acp_returns_400(
+    client, mock_conversation_service, mock_event_service, sample_conversation_id
+):
+    """A ValueError (non-ACP agent / rejected command) maps to 400."""
+    mock_conversation_service.get_event_service.return_value = mock_event_service
+    mock_event_service.execute_acp_command.side_effect = ValueError(
+        "execute_acp_command is only supported for ACP conversations."
+    )
+    client.app.dependency_overrides[get_conversation_service] = lambda: (
+        mock_conversation_service
+    )
+    try:
+        response = client.post(
+            f"/api/conversations/{sample_conversation_id}/execute_acp_command",
+            json={"command": "compact"},
+        )
+        assert response.status_code == 400
+    finally:
+        client.app.dependency_overrides.clear()
+
+
+def test_execute_acp_command_timeout_returns_504(
+    client, mock_conversation_service, mock_event_service, sample_conversation_id
+):
+    """A TimeoutError (wedged/slow ACP server) maps to 504."""
+    mock_conversation_service.get_event_service.return_value = mock_event_service
+    mock_event_service.execute_acp_command.side_effect = TimeoutError(
+        "ACP server did not answer command within 600s"
+    )
+    client.app.dependency_overrides[get_conversation_service] = lambda: (
+        mock_conversation_service
+    )
+    try:
+        response = client.post(
+            f"/api/conversations/{sample_conversation_id}/execute_acp_command",
+            json={"command": "compact"},
+        )
+        assert response.status_code == 504
+    finally:
+        client.app.dependency_overrides.clear()
+
+
 def test_run_conversation_already_running(
     client, mock_conversation_service, mock_event_service, sample_conversation_id
 ):

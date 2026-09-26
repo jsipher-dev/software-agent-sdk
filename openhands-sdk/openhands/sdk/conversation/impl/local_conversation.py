@@ -49,6 +49,7 @@ from openhands.sdk.event import (
     PauseEvent,
     UserRejectObservation,
 )
+from openhands.sdk.event import ACPCommandResultEvent
 from openhands.sdk.event.conversation_error import ConversationErrorEvent
 from openhands.sdk.event.error_classification import AGENT_OUTCOME
 from openhands.sdk.hooks import HookConfig, HookEventProcessor, create_hook_callback
@@ -1803,6 +1804,80 @@ class LocalConversation(BaseConversation):
                 **self._state.agent_state,
                 "acp_current_model_id": model,
             }
+
+    def list_acp_commands(self) -> list[dict[str, object]]:
+        """List slash-commands advertised by the ACP server.
+
+        Returns the commands the ACP subprocess reported via its
+        ``commands/available`` extension notification (name, description, and an
+        optional input hint). Returns an empty list for a non-ACP conversation
+        or before any commands have been advertised.
+        """
+        if not isinstance(self.agent, ACPAgent):
+            return []
+        return self.agent.list_available_commands()
+
+    def execute_acp_command(self, command: str) -> dict[str, object]:
+        """Execute an ACP slash-command (e.g. ``compact``) on the live session.
+
+        Args:
+            command: Command name (with or without the leading slash).
+
+        Returns:
+            The server's response as a dict with keys ``success`` (bool),
+            ``command`` (normalized ``/name``), ``message`` (human-readable
+            output, or ``None``), and ``data`` (structured payload, or ``None``).
+
+        Side effect:
+            Emits an :class:`ACPCommandResultEvent` into the conversation event
+            stream (persisted and broadcast) so the command's output renders in
+            the UI. Without this, output-only commands like ``/context`` and
+            ``/usage`` executed but showed nothing.
+
+        Raises:
+            ValueError: If the agent is not an :class:`ACPAgent`, ``command`` is
+                empty, or the ACP server rejects the command.
+            RuntimeError: If the session has not started yet (first ``run()``).
+            TimeoutError: If the command round-trip exceeds the ACP timeout.
+        """
+        if not isinstance(self.agent, ACPAgent):
+            raise ValueError(
+                "execute_acp_command is only supported for ACP conversations."
+            )
+        # Command execution mutates live session state (e.g. /compact rewrites
+        # the context), so serialize it against a running step() via the state
+        # lock, mirroring switch_acp_model.
+        with self._state:
+            result = self.agent.execute_command(command)
+
+        # Surface the command output as a visible, persisted, broadcast event.
+        # Command execution happens between turns, so the agent's per-turn
+        # ``on_event`` sink is not active here; use the conversation's durable
+        # ``_on_event`` callback (the same one that stamps/persists/broadcasts
+        # every event). Emit outside the state lock so persistence/broadcast
+        # does not run under the lock.
+        try:
+            event = ACPCommandResultEvent(
+                command=str(result.get("command") or command),
+                success=bool(result.get("success", True)),
+                message=(
+                    result.get("message")
+                    if isinstance(result.get("message"), str)
+                    else None
+                ),
+                data=(
+                    result.get("data")
+                    if isinstance(result.get("data"), dict)
+                    else None
+                ),
+                provider=getattr(self.agent, "_agent_name", None),
+            )
+            self._on_event(event)
+        except Exception:
+            logger.warning(
+                "Failed to emit ACPCommandResultEvent for %r", command, exc_info=True
+            )
+        return result
 
     @observe(name="conversation.send_message")
     def send_message(self, message: str | Message, sender: str | None = None) -> None:

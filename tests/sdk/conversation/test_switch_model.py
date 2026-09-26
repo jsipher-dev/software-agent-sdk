@@ -756,3 +756,88 @@ def test_switch_llm_to_subscription_profile_keeps_condenser(
     assert conv.agent.llm.model == "regular-model"
     assert conv.agent.condenser is condenser
     assert conv.state.agent.condenser is condenser
+
+
+# ---------------------------------------------------------------------------
+# ACP slash-commands (list + execute)
+# ---------------------------------------------------------------------------
+
+
+def test_execute_acp_command_rejects_non_acp_agent():
+    """execute_acp_command is only valid for ACP conversations."""
+    conv = _make_conversation()  # plain Agent, not ACPAgent
+    with pytest.raises(ValueError, match="only supported for ACP"):
+        conv.execute_acp_command("compact")
+
+
+def test_list_acp_commands_non_acp_returns_empty():
+    """list_acp_commands returns [] for a non-ACP conversation."""
+    conv = _make_conversation()
+    assert conv.list_acp_commands() == []
+
+
+def test_list_acp_commands_returns_advertised(tmp_path):
+    """list_acp_commands surfaces the commands the ACP server advertised."""
+    from openhands.sdk.agent.acp_agent import _OpenHandsACPBridge
+
+    conv, agent = _make_acp_conversation(tmp_path)
+    # Simulate a live bridge populated by a _kiro.dev/commands/available
+    # notification.
+    bridge = _OpenHandsACPBridge()
+    bridge._available_commands = [
+        {"name": "compact", "description": "Compact the context"},
+        {"name": "usage", "description": "Show usage"},
+    ]
+    agent._client = bridge
+    names = [c["name"] for c in conv.list_acp_commands()]
+    assert names == ["compact", "usage"]
+
+
+def test_execute_acp_command_issues_protocol_call(tmp_path):
+    """execute_acp_command runs the commands/execute round-trip, returns the
+    full result dict, and emits an ACPCommandResultEvent carrying the output."""
+    from openhands.sdk.event import ACPCommandResultEvent
+
+    conv, agent = _make_acp_conversation(tmp_path)
+
+    captured: list = []
+    conv._on_event = lambda e: captured.append(e)  # type: ignore[assignment]
+
+    # The faked executor consumes the coroutine (avoiding an un-awaited
+    # warning) and returns the CommandsExecuteResponse dict with message/data.
+    def _run_async(coro, timeout=None):
+        coro.close()
+        return {
+            "success": True,
+            "message": "Context breakdown - 3% used",
+            "data": {"contextUsagePercentage": 3.4},
+        }
+
+    agent._executor.run_async = MagicMock(side_effect=_run_async)
+
+    result = conv.execute_acp_command("/context")
+
+    # Full result dict is returned (message/data preserved, not discarded).
+    assert result == {
+        "success": True,
+        "command": "/context",
+        "message": "Context breakdown - 3% used",
+        "data": {"contextUsagePercentage": 3.4},
+    }
+    agent._executor.run_async.assert_called_once()
+
+    # The command output is surfaced as a visible, persisted event.
+    events = [e for e in captured if isinstance(e, ACPCommandResultEvent)]
+    assert len(events) == 1
+    ev = events[0]
+    assert ev.command == "/context"
+    assert ev.success is True
+    assert ev.message == "Context breakdown - 3% used"
+    assert ev.data == {"contextUsagePercentage": 3.4}
+
+
+def test_execute_acp_command_empty_rejected(tmp_path):
+    """An empty command is rejected before any protocol call."""
+    conv, agent = _make_acp_conversation(tmp_path)
+    with pytest.raises(ValueError, match="non-empty"):
+        conv.execute_acp_command("   ")
